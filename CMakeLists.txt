@@ -8,3 +8,7 @@ find_package(OpenCL REQUIRED)
 
 add_executable(ocl_mmap_test test_opencl_mmap.cpp)
 target_link_libraries(ocl_mmap_test PRIVATE OpenCL::OpenCL)
+
+if (WIN32)
+	target_link_libraries(ocl_mmap_test PRIVATE Psapi)
+endif()
