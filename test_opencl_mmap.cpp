@@ -1,4 +1,6 @@
 #include <CL/cl.h>
+#include <CL/cl_ext.h>
+#include <CL/cl_ext_intel.h>
 #include <windows.h>
 #include <vector>
 #include <algorithm>
@@ -6,6 +8,7 @@
 #include <cassert>
 #include <string>
 #include <psapi.h>
+#include <cstring>
 
 // Log process memory usage (working set and private bytes) in MB with a label.
 static void log_mem_usage(const char* label) {
@@ -27,7 +30,59 @@ static void log_mem_usage(const char* label) {
   }
 }
 
+// Check if an extension is supported by device
+static bool is_extension_supported(cl_device_id device, const char* ext_name) {
+  size_t ext_size = 0;
+  clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_size);
+  if (ext_size == 0) return false;
+  
+  std::string extensions(ext_size, '\0');
+  clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, ext_size, &extensions[0], nullptr);
+  return extensions.find(ext_name) != std::string::npos;
+}
 
+// Print Intel-specific device info
+static void print_intel_device_info(cl_device_id device) {
+  std::cout << "\n[INTEL] Intel OpenCL Extensions Info:" << std::endl;
+  
+  // Check for Intel-specific extensions
+  const char* intel_extensions[] = {
+    "cl_intel_unified_shared_memory",
+    "cl_intel_required_subgroup_size",
+    "cl_intel_subgroups",
+    "cl_intel_accelerator",
+    "cl_intel_advanced_motion_estimation",
+    "cl_intel_planar_yuv",
+    "cl_intel_packed_yuv",
+    "cl_intel_motion_estimation",
+    "cl_intel_device_side_avc_motion_estimation",
+    "cl_intel_media_block_io"
+  };
+  
+  for (const char* ext : intel_extensions) {
+    bool supported = is_extension_supported(device, ext);
+    std::cout << "[INTEL]   " << ext << ": " 
+              << (supported ? "SUPPORTED" : "NOT SUPPORTED") << std::endl;
+  }
+  
+  // Get device version
+  size_t version_size = 0;
+  clGetDeviceInfo(device, CL_DEVICE_VERSION, 0, nullptr, &version_size);
+  std::string version(version_size, '\0');
+  clGetDeviceInfo(device, CL_DEVICE_VERSION, version_size, &version[0], nullptr);
+  std::cout << "[INTEL] Device Version: " << version << std::endl;
+  
+  // Get driver version
+  size_t driver_size = 0;
+  clGetDeviceInfo(device, CL_DRIVER_VERSION, 0, nullptr, &driver_size);
+  std::string driver(driver_size, '\0');
+  clGetDeviceInfo(device, CL_DRIVER_VERSION, driver_size, &driver[0], nullptr);
+  std::cout << "[INTEL] Driver Version: " << driver << std::endl;
+  std::cout << std::endl;
+}
+
+
+  
 int main() {
   const wchar_t* file_path = L"ocl_test.bin";
   const unsigned long long FILE_SIZE_BYTES = 2ull * 1024 * 1024 * 1024;  // 2 GiB file for observing usage
@@ -65,6 +120,17 @@ int main() {
   assert(mapped);
   std::cout << "[INFO] File mapped into memory (full 2 GiB view)." << std::endl;
 
+
+  // 2.5) Touch the entire mapped file
+  std::cout << "[INFO] Touching the entire mapped file to commit pages..." << std::endl;
+  {
+      volatile unsigned char* touch = static_cast<unsigned char*>(mapped);
+      for (size_t i = 0; i < expected.size(); ++i) {
+          touch[i] = touch[i];
+      }
+  }
+  log_mem_usage("");
+
    // 3) Set up OpenCL
   cl_int err = CL_SUCCESS;
   cl_uint num_platforms = 0;
@@ -88,7 +154,7 @@ int main() {
 
   // 4) Buffers: src uses host pointer (the mmap), dst is device-only
   cl_mem src = clCreateBuffer(ctx,
-                              CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+      CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR | CL_MEM_FORCE_HOST_MEMORY_INTEL,
                               static_cast<size_t>(FILE_SIZE_BYTES),
                               mapped,
                               &err);
