@@ -81,8 +81,200 @@ static void print_intel_device_info(cl_device_id device) {
   std::cout << std::endl;
 }
 
+// Compile a simple copy kernel once and reuse it.
+static cl_kernel build_copy_kernel(cl_context ctx, cl_device_id device) {
+  const char* ksrc = R"CLC(
+  __kernel void copy_buf(__global const uchar* src, __global uchar* dst) {
+    size_t i = get_global_id(0);
+    dst[i] = src[i];
+  }
+  )CLC";
 
-  
+  cl_int err = CL_SUCCESS;
+  cl_program prog = clCreateProgramWithSource(ctx, 1, &ksrc, nullptr, &err);
+  assert(err == CL_SUCCESS);
+  err = clBuildProgram(prog, 1, &device, nullptr, nullptr, nullptr);
+  if (err != CL_SUCCESS) {
+    size_t log_size = 0;
+    clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+    std::string log(log_size, '\0');
+    clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+    std::cerr << "Build log:\n" << log << std::endl;
+    assert(false);
+  }
+
+  cl_kernel kernel = clCreateKernel(prog, "copy_buf", &err);
+  assert(err == CL_SUCCESS);
+  // program can be released after kernel is created
+  clReleaseProgram(prog);
+  return kernel;
+}
+
+// Mode 1: classic buffer using CL_MEM_USE_HOST_PTR on the mmap view.
+static bool run_buffer_mode(cl_context ctx,
+              cl_command_queue q,
+              cl_kernel kernel,
+              void* mapped,
+              std::vector<unsigned char>& expected,
+              size_t bytes,
+              bool mutate_after_mapped) {
+  cl_int err = CL_SUCCESS;
+  std::cout << "[INFO] RUM BUFFER mode." << std::endl;
+  log_mem_usage("before cl buffer creation");
+  cl_mem src = clCreateBuffer(ctx,
+      CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR | CL_MEM_FORCE_HOST_MEMORY_INTEL,
+      bytes,
+      mapped,
+      &err);
+  assert(err == CL_SUCCESS);
+  std::cout << "[INFO] CL src buffer created from mmapped file" << std::endl;
+  log_mem_usage("");
+
+  cl_mem dst = clCreateBuffer(ctx,
+                              CL_MEM_WRITE_ONLY,
+                              bytes,
+                              nullptr,
+                              &err);
+  assert(err == CL_SUCCESS);
+  std::cout << "[INFO] CL dst buffer created" << std::endl;
+  log_mem_usage("");
+
+  if (mutate_after_mapped) {
+      unsigned char* mapped_bytes = static_cast<unsigned char*>(mapped);
+      const size_t check_offset = 17;
+      const unsigned char injected_value = 0xAB;
+      mapped_bytes[check_offset] = injected_value;
+      expected[check_offset] = injected_value;
+	  std::cout << "[INFO] Mutated mapped file after buffer creation at offset " << check_offset << std::endl;
+      log_mem_usage("");
+  }
+
+  err  = clSetKernelArg(kernel, 0, sizeof(cl_mem), &src);
+  err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &dst);
+  assert(err == CL_SUCCESS);
+
+
+  size_t global = bytes;
+  err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
+  assert(err == CL_SUCCESS);
+  clFinish(q);
+  std::cout << "[INFO] Kernel Execution Done" << std::endl;
+  log_mem_usage("");
+
+  std::vector<unsigned char> out(bytes, 0);
+  err = clEnqueueReadBuffer(q, dst, CL_TRUE, 0, bytes, out.data(), 0, nullptr, nullptr);
+  assert(err == CL_SUCCESS);
+
+  std::cout << "[INFO] Readback to host completed." << std::endl;
+
+  log_mem_usage("");
+
+  // Show a small sample from both buffers to confirm contents.
+  const size_t sample = static_cast<size_t>(std::min<unsigned long long>(32, bytes));
+  std::cout << "[RESULT] Expected bytes: ";
+  for (size_t i = 0; i < sample; ++i) {
+    std::cout << static_cast<unsigned>(expected[i]) << (i + 1 == sample ? '\n' : ' ');
+  }
+  std::cout << "[RESULT] Output bytes:   ";
+  for (size_t i = 0; i < sample; ++i) {
+    std::cout << static_cast<unsigned>(out[i]) << (i + 1 == sample ? '\n' : ' ');
+  }
+
+  clReleaseMemObject(src);
+  clReleaseMemObject(dst);
+
+  return out == expected;
+}
+
+// Mode 2: USM (Intel) using host-alloc (CPU resident but device-visible) and shared alloc for dst.
+static bool run_usm_mode(cl_platform_id platform,
+                         cl_context ctx,
+                         cl_device_id device,
+                         cl_command_queue q,
+                         cl_kernel kernel,
+                         void* mapped,
+                         std::vector<unsigned char>& expected,
+                         size_t bytes,
+                         bool mutate_after_mapped) {
+  if (!is_extension_supported(device, "cl_intel_unified_shared_memory")) {
+    std::cerr << "[USM] cl_intel_unified_shared_memory not supported on this device" << std::endl;
+    return false;
+  }
+
+  std::cout << "[INFO] RUM USM mode." << std::endl;
+  log_mem_usage("before usm buffer creation");
+
+  auto pHostAlloc = reinterpret_cast<clHostMemAllocINTEL_fn>(
+      clGetExtensionFunctionAddressForPlatform(platform, "clHostMemAllocINTEL"));
+  auto pSharedAlloc = reinterpret_cast<clSharedMemAllocINTEL_fn>(
+      clGetExtensionFunctionAddressForPlatform(platform, "clSharedMemAllocINTEL"));
+  auto pMemFree = reinterpret_cast<clMemFreeINTEL_fn>(
+      clGetExtensionFunctionAddressForPlatform(platform, "clMemFreeINTEL"));
+
+  if (!pHostAlloc || !pSharedAlloc || !pMemFree) {
+    std::cerr << "[USM] Failed to load USM entry points" << std::endl;
+    return false;
+  }
+
+  cl_int err = CL_SUCCESS;
+  void* usm_src = pHostAlloc(ctx, nullptr, bytes, 0, &err); // host-visible, device-visible
+  assert(err == CL_SUCCESS && usm_src);
+  std::cout << "[INFO] USM src buffer created" << std::endl;
+  log_mem_usage("");
+
+  std::memcpy(usm_src, mapped, bytes);
+  std::cout << "[INFO] USM src buffer initialized from mapped file" << std::endl;
+  log_mem_usage("");
+
+  void* usm_dst = pSharedAlloc(ctx, device, nullptr, bytes, 0, &err); // shared USM
+  assert(err == CL_SUCCESS && usm_dst);
+  std::cout << "[INFO] USM dst buffer created" << std::endl;
+  log_mem_usage("");
+
+
+  if (mutate_after_mapped) {
+    unsigned char* mapped_bytes = static_cast<unsigned char*>(mapped);
+    const size_t check_offset = 17;
+    const unsigned char injected_value = 0xAB;
+    mapped_bytes[check_offset] = injected_value;
+    expected[check_offset] = injected_value;
+    std::cout << "[INFO] Mutated mapped file after buffer creation at offset " << check_offset << std::endl;
+    log_mem_usage("");
+  }
+
+  err  = clSetKernelArgSVMPointer(kernel, 0, usm_src);
+  err |= clSetKernelArgSVMPointer(kernel, 1, usm_dst);
+  assert(err == CL_SUCCESS);
+
+  size_t global = bytes;
+  err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
+  assert(err == CL_SUCCESS);
+  clFinish(q);
+  std::cout << "[INFO] Kernel Execution Done" << std::endl;
+  log_mem_usage("");
+
+  std::vector<unsigned char> out(bytes, 0);
+  std::memcpy(out.data(), usm_dst, bytes);
+  std::cout << "[INFO] Readback to host completed." << std::endl;
+  log_mem_usage("");
+
+  // Show a small sample from both buffers to confirm contents.
+  const size_t sample = static_cast<size_t>(std::min<unsigned long long>(32, bytes));
+  std::cout << "[RESULT] Expected bytes: ";
+  for (size_t i = 0; i < sample; ++i) {
+    std::cout << static_cast<unsigned>(expected[i]) << (i + 1 == sample ? '\n' : ' ');
+  }
+  std::cout << "[RESULT] Output bytes:   ";
+  for (size_t i = 0; i < sample; ++i) {
+    std::cout << static_cast<unsigned>(out[i]) << (i + 1 == sample ? '\n' : ' ');
+  }
+
+  pMemFree(ctx, usm_src);
+  pMemFree(ctx, usm_dst);
+
+  return out == expected;
+}
+
 int main() {
   const wchar_t* file_path = L"ocl_test.bin";
   const unsigned long long FILE_SIZE_BYTES = 2ull * 1024 * 1024 * 1024;  // 2 GiB file for observing usage
@@ -109,6 +301,7 @@ int main() {
     CloseHandle(hf);
   }
   std::cout << "[INFO] File write complete." << std::endl;
+  log_mem_usage("");
 
   // 2) Map file
   HANDLE hf = CreateFileW(file_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -118,8 +311,8 @@ int main() {
   // Map the entire 2 GiB file; mapping is virtual-address backed and does not commit until touched.
   void* mapped = MapViewOfFile(hmap, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(FILE_SIZE_BYTES));
   assert(mapped);
-  std::cout << "[INFO] File mapped into memory (full 2 GiB view)." << std::endl;
-
+  std::cout << "[INFO] Mapped file created (full 2 GiB view)." << std::endl;
+  log_mem_usage("");
 
   // 2.5) Touch the entire mapped file
   std::cout << "[INFO] Touching the entire mapped file to commit pages..." << std::endl;
@@ -149,116 +342,33 @@ int main() {
   cl_command_queue q = clCreateCommandQueue(ctx, device, 0, &err);
   assert(err == CL_SUCCESS);
   std::cout << "[INFO] OpenCL context and queue created." << std::endl;
+  log_mem_usage("");
+
+
+  cl_kernel kernel = build_copy_kernel(ctx, device);
+  std::cout << "[INFO] OpenCL kernel built -- copy value from src to dst." << std::endl;
 
   log_mem_usage("");
 
-  // 4) Buffers: src uses host pointer (the mmap), dst is device-only
-  cl_mem src = clCreateBuffer(ctx,
-      CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR | CL_MEM_FORCE_HOST_MEMORY_INTEL,
-                              static_cast<size_t>(FILE_SIZE_BYTES),
-                              mapped,
-                              &err);
-  assert(err == CL_SUCCESS);
+  // Run classic buffer path
+  bool ok_buffer = run_buffer_mode(ctx, q, kernel, mapped, expected, static_cast<size_t>(FILE_SIZE_BYTES), true /*mutate_after_create*/);
+  log_mem_usage("exit buffer mode function");
+  std::cout << "[RESULT] Buffer mode " << (ok_buffer ? "PASS" : "FAIL") << std::endl;
 
-  cl_mem dst = clCreateBuffer(ctx,
-                              CL_MEM_WRITE_ONLY,
-                              static_cast<size_t>(FILE_SIZE_BYTES),
-                              nullptr,
-                              &err);
-  assert(err == CL_SUCCESS);
-  std::cout << "[INFO] OpenCL buffers created (src from map, dst device-only)." << std::endl;
+  // Run USM path
 
-  log_mem_usage("");
-
-  // Check whether the buffer sees host edits after creation (detects copy vs. zero-copy).
-  unsigned char* mapped_bytes = static_cast<unsigned char*>(mapped);
-  const size_t check_offset = 17;  // arbitrary byte to mutate
-  const unsigned char injected_value = 0xAB;
-  mapped_bytes[check_offset] = injected_value;   // mutate the file-backed mapping
-  expected[check_offset] = injected_value;       // mirror expected so validation reflects this change
-
-  // See what host pointer OpenCL reports for the buffer; if it differs, driver likely copied.
-  void* reported_host_ptr = nullptr;
-  err = clGetMemObjectInfo(src, CL_MEM_HOST_PTR, sizeof(void*), &reported_host_ptr, nullptr);
-  assert(err == CL_SUCCESS);
-
-  // 5) Kernel to copy bytes
-  const char* ksrc = R"CLC(
-  __kernel void copy_buf(__global const uchar* src, __global uchar* dst) {
-    size_t i = get_global_id(0);
-    dst[i] = src[i];
-  }
-  )CLC";
-
-  cl_program prog = clCreateProgramWithSource(ctx, 1, &ksrc, nullptr, &err);
-  assert(err == CL_SUCCESS);
-  err = clBuildProgram(prog, 1, &device, nullptr, nullptr, nullptr);
-  if (err != CL_SUCCESS) {
-    // Print build log on failure
-    size_t log_size = 0;
-    clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
-    std::string log(log_size, '\0');
-    clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
-    std::cerr << "Build log:\n" << log << std::endl;
-    assert(false);
-  }
-
-  cl_kernel kernel = clCreateKernel(prog, "copy_buf", &err);
-  assert(err == CL_SUCCESS);
-
-  err  = clSetKernelArg(kernel, 0, sizeof(cl_mem), &src);
-  err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &dst);
-  assert(err == CL_SUCCESS);
-  std::cout << "[INFO] Kernel arguments set." << std::endl;
-
-  size_t global = static_cast<size_t>(FILE_SIZE_BYTES); // one work-item per byte
-  err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
-  assert(err == CL_SUCCESS);
-  std::cout << "[INFO] Kernel enqueued with global size = " << global << std::endl;
-
-  err = clFinish(q);
-  assert(err == CL_SUCCESS);
-  std::cout << "[INFO] Kernel execution finished." << std::endl;
-
-  log_mem_usage("");
-
-  // 6) Read back and validate
-  std::vector<unsigned char> out(static_cast<size_t>(FILE_SIZE_BYTES), 0);
-  err = clEnqueueReadBuffer(q, dst, CL_TRUE, 0, static_cast<size_t>(FILE_SIZE_BYTES), out.data(), 0, nullptr, nullptr);
-  assert(err == CL_SUCCESS);
-  std::cout << "[INFO] Readback to host completed." << std::endl;
-
-  log_mem_usage("");
-
-  // Show a small sample from both buffers to confirm contents.
-  const size_t sample = static_cast<size_t>(std::min<unsigned long long>(32, FILE_SIZE_BYTES));
-  std::cout << "[RESULT] Expected bytes: ";
-  for (size_t i = 0; i < sample; ++i) {
-    std::cout << static_cast<unsigned>(expected[i]) << (i + 1 == sample ? '\n' : ' ');
-  }
-  std::cout << "[RESULT] Output bytes:   ";
-  for (size_t i = 0; i < sample; ++i) {
-    std::cout << static_cast<unsigned>(out[i]) << (i + 1 == sample ? '\n' : ' ');
-  }
-
-  if (out == expected) {
-    std::cout << "[RESULT] PASS: GPU saw the correct data from mmap-backed buffer\n";
-  } else {
-    std::cerr << "[RESULT] FAIL: Data mismatch\n";
-    return 1;
-  }
+  bool ok_usm = run_usm_mode(platform, ctx, device, q, kernel, mapped, expected,  static_cast<size_t>(FILE_SIZE_BYTES), true /*mutate_after_create*/);
+  log_mem_usage("exit usm mode function");
+  std::cout << "[RESULT] USM mode " << (ok_usm ? "PASS" : "FAIL") << std::endl;
 
   // Cleanup
   clReleaseKernel(kernel);
-  clReleaseProgram(prog);
-  clReleaseMemObject(src);
-  clReleaseMemObject(dst);
   clReleaseCommandQueue(q);
   clReleaseContext(ctx);
   if (mapped)   UnmapViewOfFile(mapped);
   if (hmap)     CloseHandle(hmap);
   if (hf)       CloseHandle(hf);
   DeleteFileW(file_path);  // e.g., L"ocl_test.bin"
-  return 0;
+  return (ok_buffer && ok_usm) ? 0 : 1;
 }
 
