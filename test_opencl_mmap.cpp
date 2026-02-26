@@ -186,13 +186,52 @@ static bool run_buffer_mode(cl_context ctx,
   return out == expected;
 }
 
+struct UsmHostView {
+  void* usm_ptr = nullptr;
+  void* view_ptr = nullptr;
+};
+
+// Allocate USM host memory and map the file onto the same address via MapViewOfFileEx.
+static UsmHostView create_usm_host_view(cl_context ctx,
+                                        cl_platform_id platform,
+                                        HANDLE hmap,
+                                        size_t bytes,
+                                        clHostMemAllocINTEL_fn pHostAlloc,
+                                        clMemFreeINTEL_fn pMemFree) {
+  SYSTEM_INFO si{};
+  GetSystemInfo(&si);
+  const size_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536;
+
+  cl_int err = CL_SUCCESS;
+  void* usm = pHostAlloc(ctx, nullptr, bytes, gran, &err);
+  if (err != CL_SUCCESS || !usm) {
+    std::cerr << "[USM] Host allocation failed, err=" << err << std::endl;
+    return {};
+  }
+
+  void* view = MapViewOfFileEx(hmap,
+                               FILE_MAP_ALL_ACCESS,
+                               0, 0,
+                               static_cast<SIZE_T>(bytes),
+                               usm);
+  if (!view) {
+    std::cerr << "[USM] MapViewOfFileEx failed, GetLastError=" << GetLastError() << std::endl;
+    pMemFree(ctx, usm);
+    return {};
+  }
+
+  log_mem_usage("after MapViewOfFileEx (USM host view)");
+
+  return {usm, view};
+}
+
 // Mode 2: USM (Intel) using host-alloc (CPU resident but device-visible) and shared alloc for dst.
 static bool run_usm_mode(cl_platform_id platform,
                          cl_context ctx,
                          cl_device_id device,
                          cl_command_queue q,
                          cl_kernel kernel,
-                         void* mapped,
+                         HANDLE hmap,
                          std::vector<unsigned char>& expected,
                          size_t bytes,
                          bool mutate_after_mapped) {
@@ -216,16 +255,15 @@ static bool run_usm_mode(cl_platform_id platform,
     return false;
   }
 
+  UsmHostView host_view = create_usm_host_view(ctx, platform, hmap, bytes, pHostAlloc, pMemFree);
+  if (!host_view.usm_ptr || !host_view.view_ptr) {
+    return false;
+  }
+  void* usm_src = host_view.usm_ptr;  // same as view_ptr
+  std::cout << "[INFO] USM host alloc and file view colocated via MapViewOfFileEx" << std::endl;
+  log_mem_usage("");
+
   cl_int err = CL_SUCCESS;
-  void* usm_src = pHostAlloc(ctx, nullptr, bytes, 0, &err); // host-visible, device-visible
-  assert(err == CL_SUCCESS && usm_src);
-  std::cout << "[INFO] USM src buffer created" << std::endl;
-  log_mem_usage("");
-
-  std::memcpy(usm_src, mapped, bytes);
-  std::cout << "[INFO] USM src buffer initialized from mapped file" << std::endl;
-  log_mem_usage("");
-
   void* usm_dst = pSharedAlloc(ctx, device, nullptr, bytes, 0, &err); // shared USM
   assert(err == CL_SUCCESS && usm_dst);
   std::cout << "[INFO] USM dst buffer created" << std::endl;
@@ -233,7 +271,7 @@ static bool run_usm_mode(cl_platform_id platform,
 
 
   if (mutate_after_mapped) {
-    unsigned char* mapped_bytes = static_cast<unsigned char*>(mapped);
+    unsigned char* mapped_bytes = static_cast<unsigned char*>(host_view.view_ptr);
     const size_t check_offset = 17;
     const unsigned char injected_value = 0xAB;
     mapped_bytes[check_offset] = injected_value;
@@ -269,6 +307,7 @@ static bool run_usm_mode(cl_platform_id platform,
     std::cout << static_cast<unsigned>(out[i]) << (i + 1 == sample ? '\n' : ' ');
   }
 
+  UnmapViewOfFile(host_view.view_ptr);
   pMemFree(ctx, usm_src);
   pMemFree(ctx, usm_dst);
 
@@ -357,7 +396,7 @@ int main() {
 
   // Run USM path
 
-  bool ok_usm = run_usm_mode(platform, ctx, device, q, kernel, mapped, expected,  static_cast<size_t>(FILE_SIZE_BYTES), true /*mutate_after_create*/);
+  bool ok_usm = run_usm_mode(platform, ctx, device, q, kernel, hmap, expected,  static_cast<size_t>(FILE_SIZE_BYTES), true /*mutate_after_create*/);
   log_mem_usage("exit usm mode function");
   std::cout << "[RESULT] USM mode " << (ok_usm ? "PASS" : "FAIL") << std::endl;
 
